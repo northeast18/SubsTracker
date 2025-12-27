@@ -8,7 +8,7 @@ binding = "SUBSCRIPTIONS_KV"
 id = "23460e88ead340cea877d6a9d754677f"
 
 [triggers]
-crons = ["0 8 * * *"]
+crons = ["0 1 * * *"]
 
 [vars]
 ENVIRONMENT = "production"
