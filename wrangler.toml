@@ -1,0 +1,20 @@
+name = "subscription-manager"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[env.production]
+name = "subscription-manager"
+
+[env.staging]
+name = "subscription-manager-staging"
+
+[[kv_namespaces]]
+binding = "SUBSCRIPTIONS_KV"
+id = "23460e88ead340cea877d6a9d754677f"
+
+[triggers]
+crons = ["0 1 * * *", "0 7 * * *"]
+
+[vars]
+ENVIRONMENT = "production"
