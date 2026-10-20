@@ -73,16 +73,57 @@ function buildTimezoneDate(year, month, day, timezone) {
 
 /**
  * 获取所有订阅（从新 repo 读取）。
+ * 会附带 reminderRules / reminderRulesSummary，供列表展示真实提醒策略。
  *
  * @param {any} env
  * @returns {Promise<Array<any>>}
  */
 async function getAllSubscriptions(env) {
   try {
-    return await subRepo.listAll(env);
+    const { listForSubscription, formatRulesSummary, legacyFieldToRule } = await import('./reminders.repo.js');
+    const subs = await subRepo.listAll(env);
+    return Promise.all(
+      subs.map(async (sub) => {
+        let rules = await listForSubscription(env, sub.id);
+        if (rules.length === 0) {
+          rules = [legacyFieldToRule(sub)];
+        }
+        return {
+          ...sub,
+          reminderRules: rules,
+          reminderRulesSummary: formatRulesSummary(rules)
+        };
+      })
+    );
   } catch (error) {
     console.error('[subscriptions] 读取列表失败:', error);
     return [];
+  }
+}
+
+/**
+ * 将多规则同步回订阅上的 legacy 提醒字段，避免列表/旧路径与规则脱节。
+ *
+ * @param {any} env
+ * @param {string} subId
+ * @param {Array<any>} rules
+ */
+async function syncLegacyReminderFields(env, subId, rules) {
+  try {
+    const { deriveLegacyFromRules } = await import('./reminders.repo.js');
+    const existing = await subRepo.getById(env, subId);
+    if (!existing) return;
+    const legacy = deriveLegacyFromRules(rules);
+    await subRepo.save(env, {
+      ...existing,
+      reminderUnit: legacy.unit,
+      reminderValue: legacy.value,
+      reminderDays: legacy.unit === 'day' ? legacy.value : undefined,
+      reminderHours: legacy.unit === 'hour' ? legacy.value : undefined,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('[subscriptions] 同步 legacy 提醒字段失败:', error);
   }
 }
 
@@ -113,6 +154,7 @@ async function createSubscription(subscription, env) {
     const timezone = config.TIMEZONE || 'Asia/Shanghai';
     const now = getNowInTimezone(timezone);
     const todayMidnight = getTimezoneMidnightTimestamp(now.utc, timezone);
+    const autoRenew = subscription.autoRenew !== false;
     const startDate = parseOptionalDateInTimezone(subscription.startDate, timezone);
     let expiryDate = parseOptionalDateInTimezone(subscription.expiryDate, timezone);
     if (!expiryDate) {
@@ -128,7 +170,7 @@ async function createSubscription(subscription, env) {
         expiryParts.day
       );
 
-      if (lunar && subscription.periodValue && subscription.periodUnit) {
+      if (autoRenew && lunar && subscription.periodValue && subscription.periodUnit) {
         while (getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight) {
           lunar = lunarBiz.addLunarPeriod(lunar, subscription.periodValue, subscription.periodUnit);
           const solar = lunarBiz.lunar2solar(lunar);
@@ -136,13 +178,15 @@ async function createSubscription(subscription, env) {
         }
       }
     } else {
-      if (getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight && subscription.periodValue && subscription.periodUnit) {
+      if (autoRenew && getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight && subscription.periodValue && subscription.periodUnit) {
         while (getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight) {
+          const endOfMonth = !!subscription.endOfMonth && !useLunar;
           expiryDate = addCalendarPeriodInTimezone(
             expiryDate,
             subscription.periodValue,
             subscription.periodUnit,
-            timezone
+            timezone,
+            { endOfMonth }
           );
         }
       }
@@ -151,6 +195,7 @@ async function createSubscription(subscription, env) {
     const reminderSetting = resolveReminderSetting(subscription);
     const normalizedStartDate = startDate ? startDate.toISOString() : null;
     const normalizedExpiryDate = expiryDate.toISOString();
+    const endOfMonthFlag = !!subscription.endOfMonth && !useLunar;
 
     const initialPaymentDate = normalizedStartDate || now.utc.toISOString();
     const newSubscription = {
@@ -163,6 +208,7 @@ async function createSubscription(subscription, env) {
       expiryDate: normalizedExpiryDate,
       periodValue: subscription.periodValue || 1,
       periodUnit: subscription.periodUnit || 'month',
+      endOfMonth: endOfMonthFlag,
       reminderUnit: reminderSetting.unit,
       reminderValue: reminderSetting.value,
       reminderDays: reminderSetting.unit === 'day' ? reminderSetting.value : undefined,
@@ -190,7 +236,7 @@ async function createSubscription(subscription, env) {
             ]
           : [],
       isActive: subscription.isActive !== false,
-      autoRenew: subscription.autoRenew !== false,
+      autoRenew,
       useLunar: useLunar,
       createdAt: new Date().toISOString()
     };
@@ -227,6 +273,11 @@ async function updateSubscription(id, subscription, env) {
     const timezone = config.TIMEZONE || 'Asia/Shanghai';
     const now = getNowInTimezone(timezone);
     const todayMidnight = getTimezoneMidnightTimestamp(now.utc, timezone);
+    const autoRenew = subscription.autoRenew !== undefined
+      ? subscription.autoRenew
+      : existing.autoRenew !== undefined
+        ? existing.autoRenew
+        : true;
     const incomingStartDate = parseOptionalDateInTimezone(subscription.startDate, timezone);
     let expiryDate = parseOptionalDateInTimezone(subscription.expiryDate, timezone);
     if (!expiryDate) {
@@ -244,7 +295,7 @@ async function updateSubscription(id, subscription, env) {
       if (!lunar) {
         return { success: false, message: '农历日期超出支持范围（1900-2100年）' };
       }
-      if (lunar && getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight && subscription.periodValue && subscription.periodUnit) {
+      if (autoRenew && lunar && getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight && subscription.periodValue && subscription.periodUnit) {
         do {
           lunar = lunarBiz.addLunarPeriod(lunar, subscription.periodValue, subscription.periodUnit);
           const solar = lunarBiz.lunar2solar(lunar);
@@ -252,13 +303,18 @@ async function updateSubscription(id, subscription, env) {
         } while (getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight);
       }
     } else {
-      if (getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight && subscription.periodValue && subscription.periodUnit) {
+      const endOfMonth =
+        subscription.endOfMonth !== undefined
+          ? !!subscription.endOfMonth && !useLunar
+          : !!existing.endOfMonth && !useLunar;
+      if (autoRenew && getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight && subscription.periodValue && subscription.periodUnit) {
         while (getTimezoneMidnightTimestamp(expiryDate, timezone) < todayMidnight) {
           expiryDate = addCalendarPeriodInTimezone(
             expiryDate,
             subscription.periodValue,
             subscription.periodUnit,
-            timezone
+            timezone,
+            { endOfMonth }
           );
         }
       }
@@ -322,6 +378,10 @@ async function updateSubscription(id, subscription, env) {
       expiryDate: expiryDate.toISOString(),
       periodValue: subscription.periodValue || existing.periodValue || 1,
       periodUnit: subscription.periodUnit || existing.periodUnit || 'month',
+      endOfMonth:
+        subscription.endOfMonth !== undefined
+          ? !!subscription.endOfMonth && !useLunar
+          : !!existing.endOfMonth && !useLunar,
       reminderUnit: reminderSetting.unit,
       reminderValue: reminderSetting.value,
       reminderDays: reminderSetting.unit === 'day' ? reminderSetting.value : undefined,
@@ -336,12 +396,7 @@ async function updateSubscription(id, subscription, env) {
         now.utc.toISOString(),
       paymentHistory,
       isActive: subscription.isActive !== undefined ? subscription.isActive : existing.isActive,
-      autoRenew:
-        subscription.autoRenew !== undefined
-          ? subscription.autoRenew
-          : existing.autoRenew !== undefined
-            ? existing.autoRenew
-            : true,
+      autoRenew,
       useLunar: useLunar,
       updatedAt: new Date().toISOString()
     };
@@ -366,6 +421,13 @@ async function deleteSubscription(id, env) {
   try {
     const ok = await subRepo.deleteById(env, id);
     if (!ok) return { success: false, message: '订阅不存在' };
+    // 联动清理提醒规则，避免孤儿 reminder_rules:{id}
+    try {
+      const remindersRepo = await import('./reminders.repo.js');
+      await remindersRepo.clearForSubscription(env, id);
+    } catch (err) {
+      console.error('[subscriptions] 清理提醒规则失败（订阅已删除）:', err);
+    }
     return { success: true };
   } catch (error) {
     console.error('[subscriptions] 删除订阅失败:', error);
@@ -434,7 +496,8 @@ async function manualRenewSubscription(id, env, options = {}) {
         newStartDate,
         totalPeriodValue,
         subscription.periodUnit,
-        timezone
+        timezone,
+        { endOfMonth: !!subscription.endOfMonth }
       );
     }
 
@@ -624,5 +687,6 @@ export {
   manualRenewSubscription,
   deletePaymentRecord,
   updatePaymentRecord,
-  toggleSubscriptionStatus
+  toggleSubscriptionStatus,
+  syncLegacyReminderFields
 };

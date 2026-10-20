@@ -141,7 +141,9 @@ describe('调度器 - 时区 + 通知时段', () => {
       name: 'Multi',
       isActive: true,
       autoRenew: false,
-      expiryDate: '2026-05-27T03:00:00.000Z'
+      expiryDate: '2026-05-27T03:00:00.000Z',
+      reminderUnit: 'day',
+      reminderValue: 7
     });
     await remindersRepo.replaceForSubscription(env, 's-multi', [
       remindersRepo.normalizeRule({ type: 'before_expiry', value: 7, unit: 'days' }),
@@ -150,12 +152,15 @@ describe('调度器 - 时区 + 通知时段', () => {
       remindersRepo.normalizeRule({ type: 'on_expiry', value: 0, unit: 'days' })
     ]);
 
-    mockTelegramOk();
+    const fetchSpy = mockTelegramOk();
     const log = await checkExpiringSubscriptions(env);
     expect(log.matchedCount).toBe(1); // 只命中 value=3
     expect(log.sentCount).toBe(1);
     expect(log.extra.candidates).toHaveLength(1);
     expect(log.extra.candidates[0].ruleValue).toBe(3);
+    const sentBody = JSON.parse(fetchSpy.mock.calls[0][1].body);
+    expect(sentBody.text).toContain('提醒策略: 提前 3 天');
+    expect(sentBody.text).not.toContain('提醒策略: 提前 7 天');
   });
 
   it('场景4：同规则同小时第二次调用 → 去重跳过', async () => {
@@ -225,6 +230,27 @@ describe('调度器 - 时区 + 通知时段', () => {
 });
 
 describe('调度器 - 自动续订', () => {
+  it('已过期 + autoRenew=false → 保留到期日和支付历史', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-05-24T00:00:00.000Z'));
+    await setConfig({
+      JWT_SECRET: 's', TIMEZONE: 'Asia/Shanghai',
+      NOTIFICATION_HOURS: [], ENABLED_NOTIFIERS: []
+    });
+    const subscription = {
+      id: 's-no-renew', name: 'No renew', isActive: true, autoRenew: false,
+      expiryDate: '2026-04-01T00:00:00.000Z', periodValue: 1,
+      periodUnit: 'month', amount: 10, paymentHistory: []
+    };
+    await subRepo.save(env, subscription);
+
+    const log = await checkExpiringSubscriptions(env);
+    expect(log.autoRenewedCount).toBe(0);
+    const saved = await subRepo.getById(env, subscription.id);
+    expect(saved.expiryDate).toBe(subscription.expiryDate);
+    expect(saved.paymentHistory).toEqual([]);
+  });
+
   it('已过期 + autoRenew=true → 推进到期日 + 写 auto 支付记录', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-05-24T00:00:00.000Z'));
